@@ -1,0 +1,156 @@
+# MITSUI&CO
+
+# --- Data Manipulation ---
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# --- Data Visualisation ---
+import seaborn as sns
+import matplotlib.pyplot as plt
+import plotly.express as px
+
+# --- Network Analysis ---
+import networkx as nx
+
+# --- Utilities ---
+import re
+import random
+import warnings
+
+# --- Set global configurations ---
+warnings.filterwarnings('ignore')
+pd.set_option('display.max_columns', None) # To display all columns of a DataFrame
+plt.style.use('seaborn')
+sns.set_palette('muted')
+# For Jupyter notebooks
+%matplotlib inline
+from IPython.display import display
+# Function similar to figsize()
+def figsize(width, height):
+ plt.rcParams['figure.figsize'] = (width, height)
+
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
+
+from xgboost import XGBRegressor
+from statsmodels.tsa.arima.model import ARIMA
+from keras.models import Sequential
+from keras.layers import LSTM, Dense, Dropout
+
+# ===============================
+# 2. Load & Prepare Data
+# ===============================
+file_path = '/Kaggle/input/mitsui-commodity-prediction-challenge/'
+
+train = pd.read_csv(f'{file_path}train.csv')
+labels = pd.read_csv(f'{file_path}train_labels.csv')
+pairs = pd.read_csv(f'{file_path}target_pairs.csv')
+test = pd.read_csv(f'{file_path}test.csv')
+
+# Combine data and lables
+try:
+ df_train = pd.read_csv("train.csv")
+ df_labels = pd.read_csv("train_labels.csv")
+
+ df_full = pd.merge(df_train[['date_id']], df_labels, on='date_id')
+ df_full['date_id'] = pd.to_datetime(df_full['date_id'], format='%Y%m%d')
+ df_full = df_full.set_index('date_id').sort_index()
+
+# Select a target series for forecasting
+  df = df_full[['target_0']].rename(columns={'target_0': 'price'})
+    print("DataFrame head (Target 'target_0' selected as 'price'):")
+    print(df.head())
+
+except FileNotFoundError as e:
+    print(f"Error loading files. Ensure they are in the correct directory. {e}")
+    exit()
+# ===============================
+# 3. Feature Engineering
+# ===============================
+
+
+def create_features(data, lags=[1,7,30]):
+    df_feat = data.copy()
+    for lag in lags:
+        df_feat[f"lag_{lag}"] = df_feat["price"].shift(lag)
+    df_feat["rolling_mean_7"] = df_feat["price"].rolling(7).mean()
+    df_feat["rolling_mean_30"] = df_feat["price"].rolling(30).mean()
+    df_feat["month"] = df_feat.index.month
+    df_feat["year"] = df_feat.index.year
+    return df_feat.dropna()
+
+df_feat = create_features(df)
+print("\nFeatures Created:")
+print(df_feat.shape)
+
+# ===============================
+# 4. Train-Test Split (Walk Forward)
+# ===============================
+train_size = int(len(df_feat) * 0.8)
+train, test = df_feat.iloc[:train_size], df_feat.iloc[train_size:]
+
+X_train, y_train = train.drop("price", axis=1), train["price"]
+X_test, y_test = test.drop("price", axis=1), test["price"]
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ===============================
+# 5. Baseline Model (ARIMA)
+# ===============================
+arima_model = ARIMA(train["price"], order=(5,1,0))
+arima_fit = arima_model.fit()
+arima_forecast = arima_fit.forecast(steps=len(test))
+
+# ===============================
+# 6. Machine Learning (XGBoost)
+# ===============================
+xgb = XGBRegressor(n_estimators=500, learning_rate=0.05, max_depth=5)
+xgb.fit(X_train_scaled, y_train)
+xgb_pred = xgb.predict(X_test_scaled)
+
+# ===============================
+# 7. Deep Learning (LSTM)
+# ===============================
+# Reshape for LSTM [samples, timesteps, features]
+X_train_lstm = np.reshape(X_train_scaled, (X_train_scaled.shape[0], 1, X_train_scaled.shape[1]))
+X_test_lstm = np.reshape(X_test_scaled, (X_test_scaled.shape[0], 1, X_test_scaled.shape[1]))
+
+lstm = Sequential()
+lstm.add(LSTM(64, return_sequences=False, input_shape=(X_train_lstm.shape[1], X_train_lstm.shape[2])))
+lstm.add(Dropout(0.2))
+lstm.add(Dense(1))
+lstm.compile(optimizer="adam", loss="mse")
+
+lstm.fit(X_train_lstm, y_train, epochs=20, batch_size=32, verbose=1)
+lstm_pred = lstm.predict(X_test_lstm).flatten()
+
+# ===============================
+# 8. Evaluation
+# ===============================
+def evaluate(y_true, y_pred, model_name):
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    print(f"{model_name} → MAPE: {mape:.4f}, RMSE: {rmse:.2f}")
+
+evaluate(y_test, arima_forecast, "ARIMA")
+evaluate(y_test, xgb_pred, "XGBoost")
+evaluate(y_test, lstm_pred, "LSTM")
+
+# ===============================
+# 9. Plot Forecasts
+# ===============================
+plt.figure(figsize=(12,6))
+plt.plot(test.index, y_test, label="True", linewidth=2)
+plt.plot(test.index, arima_forecast, label="ARIMA", linestyle='--')
+plt.plot(test.index, xgb_pred, label="XGBoost", linestyle='-.')
+plt.plot(test.index, lstm_pred, label="LSTM", linestyle=':')
+plt.legend()
+plt.title("Commodity Price Forecasting (Target_0)")
+plt.xlabel("Date")
+plt.ylabel("Price Change (Target_0)")
+plt.grid(True)
+plt.show()
